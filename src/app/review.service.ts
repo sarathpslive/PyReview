@@ -1,5 +1,6 @@
-﻿import { Injectable, signal } from '@angular/core';
-import demoReviewOutput from '../../demo/sample_review_output.json';
+﻿import { HttpClient } from '@angular/common/http';
+import { Injectable, inject, signal } from '@angular/core';
+import { firstValueFrom } from 'rxjs';
 
 export type ReviewInput = 'Paste code' | 'Upload file' | 'GitHub URL';
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'suggestion' | 'warning';
@@ -15,21 +16,29 @@ export interface InlineComment {
 
 interface DemoFinding {
   line: number;
-  severity: 'critical' | 'high' | 'medium' | 'low' | 'suggestion';
+  severity?: Severity | string;
+  rule_id: string;
   message: string;
   recommendation: string;
   evidence: string;
-  replacement: string;
+  replacement?: string;
 }
 
-interface DemoReviewResponse {
-  source_code: string;
-  findings: DemoFinding[];
+interface ApiReviewResponse {
+  review_id: string;
+  language: string;
+  source: string;
+  findings?: DemoFinding[];
   summary: string;
   owasp_context: string[];
+  recommendations?: string[];
+  llm_provider?: string;
+  llm_model?: string;
+  llm_fallback_used?: boolean;
 }
 
-const DEMO_REVIEW = demoReviewOutput as DemoReviewResponse;
+const API_URL = 'http://127.0.0.1:8000/api/v1/review';
+const REVIEW_START_URL = `${API_URL}/start`;
 
 export interface ReviewRecord {
   id: string;
@@ -48,54 +57,77 @@ export interface ReviewRecord {
   comments: InlineComment[];
   summary?: string;
   owaspContext?: string[];
+  recommendations?: string[];
+  engine?: string;
 }
 
 @Injectable({ providedIn: 'root' })
 export class ReviewService {
+  private readonly http = inject(HttpClient);
   private readonly storageKey = 'pyreview.history.v2';
+  private readonly pendingKey = 'pyreview.pending-review';
   readonly current = signal<ReviewRecord | null>(null);
   readonly history = signal<ReviewRecord[]>(this.readHistory());
 
-  submit(source: ReviewInput, name: string, code: string): string {
-    const mappedComments: InlineComment[] = DEMO_REVIEW.findings.map(finding => ({
-      line: finding.line,
-      severity: this.mapSeverity(finding.severity),
-      title: finding.message,
-      body: `${finding.recommendation} (${finding.evidence})`,
-      evidence: finding.evidence,
-      replacement: finding.replacement
-    }));
-    const criticalFindings = mappedComments.filter(comment => comment.severity === 'critical').length;
-    const highFindings = mappedComments.filter(comment => comment.severity === 'high').length;
-    const mediumFindings = mappedComments.filter(comment => comment.severity === 'medium').length;
-    const lowFindings = mappedComments.filter(comment => comment.severity === 'low').length;
-    const suggestions = mappedComments.filter(comment => comment.severity === 'suggestion').length;
-    const findings = mappedComments.length;
+  startReview(source: ReviewInput, name: string, code: string): Promise<string> {
+    return firstValueFrom(this.http.post<{ review_id: string }>(REVIEW_START_URL, { code_snippet: code, language: 'python' })).then(response => {
+      sessionStorage.setItem(this.pendingKey, JSON.stringify({ source, name, code }));
+      return response.review_id;
+    });
+  }
 
-    const review: ReviewRecord = {
-      id: this.createId(),
-      name: this.createUniqueName(),
-      source,
-      language: 'Python',
-      score: Math.max(0, 100 - criticalFindings * 25 - highFindings * 15 - mediumFindings * 8 - lowFindings * 3 - suggestions * 2),
-      findings,
-      criticalFindings,
-      highFindings,
-      mediumFindings,
-      lowFindings,
-      suggestions,
-      time: 'Just now',
-      code: DEMO_REVIEW.source_code,
-      comments: mappedComments,
-      summary: DEMO_REVIEW.summary,
-      owaspContext: DEMO_REVIEW.owasp_context
-    };
+  pendingReview(): { source: ReviewInput; name: string; code: string } | undefined {
+    try { return JSON.parse(sessionStorage.getItem(this.pendingKey) ?? 'null') ?? undefined; } catch { return undefined; }
+  }
 
+  getReviewStatus(id: string): Promise<{ status: string; result?: ApiReviewResponse; error?: string }> {
+    return firstValueFrom(this.http.get<{ status: string; result?: ApiReviewResponse; error?: string }>(`${API_URL}/${encodeURIComponent(id)}`));
+  }
+
+  storeApiResult(response: ApiReviewResponse, source: ReviewInput = 'Paste code', name = 'pasted-snippet.py', code = ''): void {
+    const comments: InlineComment[] = (response.findings ?? []).map(finding => ({ line: finding.line, severity: this.mapSeverity(finding.severity), title: finding.message, body: `${finding.recommendation} (${finding.rule_id})`, evidence: finding.evidence, replacement: finding.replacement }));
+    const counts = this.countSeverities(comments);
+    const review: ReviewRecord = { id: response.review_id, name: this.createUniqueName(), source, language: response.language || 'Python', score: Math.max(0, 100 - counts.criticalFindings * 25 - counts.highFindings * 15 - counts.mediumFindings * 8 - counts.lowFindings * 3 - counts.suggestions * 2), findings: comments.length, ...counts, time: 'Just now', code, comments, summary: response.summary, owaspContext: response.owasp_context, recommendations: response.recommendations ?? [], engine: response.llm_fallback_used ? 'Deterministic fallback' : response.llm_provider };
+    const nextHistory = [review, ...this.history().filter(item => item.id !== review.id)];
     this.current.set(review);
-    const nextHistory = [review, ...this.history()];
     this.history.set(nextHistory);
     this.saveHistory(nextHistory);
-    return review.id;
+  }
+
+  submit(source: ReviewInput, name: string, code: string): Promise<string> {
+    return firstValueFrom(this.http.post<ApiReviewResponse>(API_URL, { code_snippet: code, language: 'python' })).then(response => {
+      const mappedComments: InlineComment[] = (response.findings ?? []).map(finding => ({
+        line: finding.line,
+        severity: this.mapSeverity(finding.severity),
+        title: finding.message,
+        body: `${finding.recommendation} (${finding.rule_id})`,
+        evidence: finding.evidence,
+        replacement: finding.replacement
+      }));
+      const counts = this.countSeverities(mappedComments);
+      const review: ReviewRecord = {
+        id: response.review_id || this.createId(),
+        name: this.createUniqueName(),
+        source,
+        language: response.language || 'Python',
+        score: Math.max(0, 100 - counts.criticalFindings * 25 - counts.highFindings * 15 - counts.mediumFindings * 8 - counts.lowFindings * 3 - counts.suggestions * 2),
+        findings: mappedComments.length,
+        ...counts,
+        time: 'Just now',
+        code,
+        comments: mappedComments,
+        summary: response.summary,
+        owaspContext: response.owasp_context,
+        recommendations: response.recommendations ?? [],
+        engine: response.llm_fallback_used ? 'Deterministic fallback' : response.llm_provider
+      };
+
+      this.current.set(review);
+      const nextHistory = [review, ...this.history()];
+      this.history.set(nextHistory);
+      this.saveHistory(nextHistory);
+      return review.id;
+    });
   }
 
   load(review: ReviewRecord): void {
@@ -144,7 +176,23 @@ export class ReviewService {
     }
   }
 
+  private countSeverities(comments: InlineComment[]): { criticalFindings: number; highFindings: number; mediumFindings: number; lowFindings: number; suggestions: number } {
+    return {
+      criticalFindings: comments.filter(comment => comment.severity === 'critical').length,
+      highFindings: comments.filter(comment => comment.severity === 'high').length,
+      mediumFindings: comments.filter(comment => comment.severity === 'medium').length,
+      lowFindings: comments.filter(comment => comment.severity === 'low').length,
+      suggestions: comments.filter(comment => comment.severity === 'suggestion').length
+    };
+  }
+
   private mapSeverity(severity: DemoFinding['severity']): Severity {
-    return severity;
+    const normalized = typeof severity === 'string' ? severity.trim().toLowerCase() : '';
+    if (normalized === 'critical' || normalized === 'error') return 'critical';
+    if (normalized === 'high') return 'high';
+    if (normalized === 'medium' || normalized === 'warning') return 'medium';
+    if (normalized === 'low') return 'low';
+    if (normalized === 'suggestion' || normalized === 'info') return 'suggestion';
+    return 'critical';
   }
 }
