@@ -73,6 +73,7 @@ import { ReviewService, Severity } from './review.service';
                 </div>
                 <h3>{{ note.title }}</h3>
                 <p>{{ note.body }}</p>
+                <span class="fix-estimate">EST. FIX <b>{{ estimateHours(note.severity) }}</b></span>
               </article>
             } }
             @if ((item.recommendations ?? []).length > 0) {
@@ -94,7 +95,7 @@ import { ReviewService, Severity } from './review.service';
 
         @if (selectedFinding(); as note) {
           <section class="comparison-panel">
-            <div class="comparison-header"><div><span class="panel-kicker">SUGGESTED CHANGE</span><h2>{{ note.title }}</h2></div><span>line {{ note.line }}</span></div>
+            <div class="comparison-header"><div><span class="panel-kicker">SUGGESTED CHANGE</span><h2>{{ note.title }}</h2></div><span>line {{ note.line }} · {{ estimateHours(note.severity) }} estimated</span></div>
             <div class="comparison-grid">
               <div class="comparison-pane removed"><div class="comparison-label"><span>−</span> Current code</div><pre>{{ sourceLine(item.code, note.line) }}</pre></div>
               <div class="comparison-pane added"><div class="comparison-label"><span>+</span> Suggested replacement</div><pre>{{ note.replacement || 'No replacement snippet provided.' }}</pre></div>
@@ -137,6 +138,13 @@ export class ReviewComponent {
   }
   marker(severity: Severity): string { return severity === 'critical' ? '!' : severity === 'high' ? '◆' : severity === 'medium' || severity === 'warning' ? '▲' : severity === 'low' ? '•' : '·'; }
   severityLabel(severity: Severity): string { return severity === 'warning' ? 'medium' : severity; }
+  estimateHours(severity: Severity): string {
+    if (severity === 'critical') return '4-8 hours';
+    if (severity === 'high') return '2-4 hours';
+    if (severity === 'medium' || severity === 'warning') return '1-2 hours';
+    if (severity === 'low') return '30-60 min';
+    return '15-30 min';
+  }
   owaspCode(context: string): string {
     const codes: Record<string, string> = {
       'Broken Access Control': 'A01',
@@ -213,15 +221,18 @@ export class ReviewComponent {
     } else {
       item.comments.forEach(note => {
         const detailLines = this.pdfWrap(`Recommendation: ${note.body}`, 92);
+        const evidenceLines = this.pdfWrap(`Evidence: ${note.evidence ?? 'Not provided'}`, 92);
         const replacementLines = this.pdfWrap(`Suggested replacement: ${note.replacement ?? 'None provided'}`, 92);
-        const height = 48 + (detailLines.length + replacementLines.length) * 11;
+        const height = 48 + (evidenceLines.length + detailLines.length + replacementLines.length + 1) * 11;
         ensureSpace(height);
         const colors = this.pdfSeverityPalette(note.severity);
         commands.push(this.pdfRect(46, y - height, 520, height, colors.background, colors.accent));
         commands.push(this.pdfText(`${this.severityLabel(note.severity).toUpperCase()}  |  LINE ${note.line}`, 62, y - 18, 7, colors.accent));
         commands.push(this.pdfText(note.title, 62, y - 36, 11, '0.09 0.13 0.20'));
         let textY = y - 54;
+        evidenceLines.forEach(line => { commands.push(this.pdfText(line, 62, textY, 7.5, colors.accent)); textY -= 11; });
         detailLines.forEach(line => { commands.push(this.pdfText(line, 62, textY, 7.5, '0.35 0.42 0.50')); textY -= 11; });
+        commands.push(this.pdfText(`Estimated fix: ${this.estimateHours(note.severity)}`, 62, textY, 7.5, colors.accent)); textY -= 13;
         textY -= 2;
         replacementLines.forEach(line => { commands.push(this.pdfText(line, 62, textY, 7.5, '0.22 0.48 0.36')); textY -= 11; });
         y -= height + 14;
@@ -232,6 +243,45 @@ export class ReviewComponent {
     commands.push(this.pdfLine(46, y - 10, 566, y - 10, '0.72 0.78 0.86'));
     y -= 30;
     this.pdfWrap(item.summary ?? 'No summary provided.', 100).forEach(line => { commands.push(this.pdfText(line, 46, y, 8.5, '0.35 0.42 0.50')); y -= 13; });
+    y -= 12;
+    if ((item.recommendations ?? []).length) {
+      ensureSpace(80);
+      commands.push(this.pdfText('Engine recommendations', 46, y, 15, '0.09 0.13 0.20'));
+      commands.push(this.pdfLine(46, y - 10, 566, y - 10, '0.72 0.78 0.86'));
+      y -= 28;
+      item.recommendations?.forEach(recommendation => {
+        this.pdfWrap(`- ${recommendation}`, 100).forEach(line => { commands.push(this.pdfText(line, 52, y, 8, '0.35 0.42 0.50')); y -= 12; });
+        y -= 3;
+      });
+      y -= 8;
+    }
+    ensureSpace(145);
+    commands.push(this.pdfText('Severity distribution', 46, y, 15, '0.09 0.13 0.20'));
+    commands.push(this.pdfLine(46, y - 10, 566, y - 10, '0.72 0.78 0.86'));
+    y -= 28;
+    const maxSeverity = Math.max(item.findings, 1);
+    const severityRows: Array<[string, number, string]> = [
+      ['Critical', item.criticalFindings, '0.77 0.24 0.32'], ['High', item.highFindings, '0.72 0.47 0.09'],
+      ['Medium', item.mediumFindings, '0.18 0.43 0.76'], ['Low', item.lowFindings, '0.40 0.46 0.53'], ['Suggestions', item.suggestions, '0.30 0.54 0.38']
+    ];
+    severityRows.forEach(([label, count, color]) => {
+      commands.push(this.pdfText(label, 46, y, 8, '0.35 0.42 0.50'));
+      commands.push(this.pdfRect(120, y - 5, 350, 9, '0.94 0.96 0.98', '0.88 0.90 0.93'));
+      if (count > 0) commands.push(this.pdfRect(120, y - 5, Math.max(8, (count / maxSeverity) * 350), 9, color, color));
+      commands.push(this.pdfText(String(count), 485, y, 8, color));
+      y -= 20;
+    });
+    ensureSpace(130);
+    commands.push(this.pdfText('OWASP Top 10 context', 46, y, 15, '0.09 0.13 0.20'));
+    commands.push(this.pdfLine(46, y - 10, 566, y - 10, '0.72 0.78 0.86'));
+    y -= 28;
+    (item.owaspContext ?? []).forEach(context => {
+      if (y < 60) { addPage(); y = 700; commands.push(this.pdfText('OWASP Top 10 context (continued)', 46, y, 15, '0.09 0.13 0.20')); y -= 24; }
+      commands.push(this.pdfRect(46, y - 5, 38, 15, '0.91 0.95 1', '0.18 0.43 0.76'));
+      commands.push(this.pdfText(this.owaspCode(context), 53, y, 7, '0.18 0.43 0.76'));
+      commands.push(this.pdfText(context, 96, y, 8, '0.35 0.42 0.50'));
+      y -= 20;
+    });
     y -= 12;
     ensureSpace(100);
     commands.push(this.pdfText('Source code', 46, y, 15, '0.09 0.13 0.20'));
@@ -266,7 +316,7 @@ export class ReviewComponent {
       'q', '1 1 1 rg', '0 0 612 792 re', 'f', 'Q',
       'q', '0.05 0.09 0.17 rg', '0 730 612 62 re', 'f', 'Q',
       this.pdfText('PyReview', 42, 764, 22, '1 1 1'),
-      this.pdfText('CODE REVIEW REPORT', 44, 744, 8, '0.45 0.90 0.84'),
+      this.pdfText('SECURITY & QUALITY REVIEW', 44, 744, 8, '0.45 0.90 0.84'),
       this.pdfText(`${item.name}  |  ${item.language}  |  ${item.score}/100`, 350, 758, 7, '0.76 0.83 0.92'),
       this.pdfText(`Review ID: ${item.id}`, 350, 744, 7, '0.76 0.83 0.92')
     ];
