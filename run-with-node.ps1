@@ -7,5 +7,6 @@ $env:PATH = "$NodeDir;$env:PATH"
 Push-Location $ProjectDir
 Write-Host "Using Node from $NodeDir"
 # Run the Angular dev server with the node version at $NodeDir
-npx ng serve --host 0.0.0.0 --port 4200
+$env:NG_CLI_ANALYTICS = 'false'
+& "$NodeDir\node.exe" "$ProjectDir\node_modules\@angular\cli\bin\ng.js" serve --host 0.0.0.0 --port 4200
 Pop-Location

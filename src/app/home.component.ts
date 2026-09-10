@@ -85,6 +85,7 @@ export class HomeComponent {
   @ViewChild('reviewStep') reviewStep?: ElementRef<HTMLElement>;
   readonly loadingWorkflowNodes = [
     { id: 'orchestrator', label: 'Orchestrator', icon: 'account_tree' },
+    { id: 'github_mcp', label: 'GitHub MCP', icon: 'hub' },
     { id: 'deterministic_ast', label: 'Deterministic AST', icon: 'code' },
     { id: 'ruff', label: 'Ruff', icon: 'rule' },
     { id: 'rag', label: 'Tool call: RAG', icon: 'database_search' },
@@ -206,21 +207,27 @@ export class HomeComponent {
     const code = this.source() === 'Paste code' ? this.code : this.source() === 'Upload file' ? this.fileCode : this.githubUrl;
     if (this.fileLoading() || this.reviewLoading()) return;
     if (!code.trim()) {
-      this.inputError.set('Add some Python code before starting the review.');
+      this.inputError.set(this.source() === 'GitHub URL' ? 'Enter a valid GitHub URL before starting the review.' : 'Add some Python code before starting the review.');
       return;
     }
+
+    let targetName = this.fileName;
     if (this.source() === 'GitHub URL') {
-      this.inputError.set('GitHub URL review is not supported by the review endpoint yet. Upload or paste the code for now.');
-      return;
+      const urlParts = this.githubUrl.trim().split('/');
+      const lastPart = urlParts[urlParts.length - 1] || 'github-source.py';
+      targetName = lastPart.includes('.') ? lastPart : `${lastPart}.py`;
+    } else if (!targetName) {
+      targetName = `pasted-snippet.${this.selectedLanguage().extensions[0]}`;
     }
+
     this.reviewLoading.set(true);
     this.step.set(2);
     this.reviewStage.set('Launching the code-review mothership...');
-    this.service.submit(this.source(), this.fileName || `pasted-snippet.${this.selectedLanguage().extensions[0]}`, code, this.languageId(), this.businessDocuments(), reviewId => this.router.navigate(['/review', reviewId])).subscribe({
+    this.service.submit(this.source(), targetName, code, this.languageId(), this.businessDocuments(), reviewId => this.router.navigate(['/review', reviewId])).subscribe({
       next: review => this.router.navigate(['/review', review.id]),
-      error: () => {
+      error: (err) => {
         this.reviewLoading.set(false);
-        this.inputError.set('The review API could not be reached. Start the backend and try again.');
+        this.inputError.set(err?.error?.detail || err?.message || 'The review API could not be reached. Start the backend and try again.');
       }
     });
   }
@@ -243,6 +250,7 @@ export class HomeComponent {
   private loadingStageEvents(stageId: string, events: Array<{ node: string; event: string }>): Array<{ node: string; event: string }> {
     return events.filter(event => {
       if (stageId === 'orchestrator') return event.node === 'orchestrator' || event.node === 'model_armor';
+      if (stageId === 'github_mcp') return event.node === 'github_mcp';
       if (stageId === 'deterministic_ast') return event.node === 'static_analysis' || event.node === 'deterministic_gate' || event.event.includes('python_ast_scanner');
       if (stageId === 'ruff') return event.node === 'ruff';
       if (stageId === 'rag') return event.node === 'rag';
@@ -255,6 +263,7 @@ export class HomeComponent {
 
   private loadingStageCompleted(stageId: string, events: Array<{ node: string; event: string }>): boolean {
     if (stageId === 'orchestrator') return events.some(event => event.node === 'orchestrator' && event.event === 'pipeline_completed');
+    if (stageId === 'github_mcp') return events.some(event => event.node === 'github_mcp');
     if (stageId === 'deterministic_ast') return events.some(event => event.node === 'static_analysis' && event.event === 'ast_completed') || events.some(event => event.node === 'deterministic_gate' && event.event === 'passed');
     if (stageId === 'ruff') return events.some(event => event.node === 'ruff' && ['scan_completed', 'scan_skipped'].includes(event.event));
     if (stageId === 'rag') return events.some(event => event.node === 'rag' && event.event === 'retrieval_completed');

@@ -1,4 +1,4 @@
-﻿import { Injectable, inject, signal } from '@angular/core';
+import { Injectable, inject, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
 
@@ -7,11 +7,18 @@ export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'suggestion' | '
 
 export interface InlineComment {
   line: number;
+  path?: string;
   severity: Severity;
   title: string;
   body: string;
   evidence?: string;
   replacement?: string;
+}
+
+export interface ReviewFile {
+  path: string;
+  name: string;
+  code: string;
 }
 
 export interface BusinessDocument {
@@ -23,6 +30,7 @@ export interface BusinessDocument {
 
 interface ReviewFinding {
   line: number;
+  path?: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'suggestion';
   message: string;
   recommendation: string;
@@ -56,6 +64,9 @@ export interface ReviewRecord {
   businessLogicFindings?: BusinessLogicFinding[];
   recommendations: string[];
   dagEvents: DagEvent[];
+  prUrl?: string;
+  prNumber?: number;
+  files?: ReviewFile[];
 }
 
 @Injectable({ providedIn: 'root' })
@@ -97,6 +108,9 @@ export class ReviewService {
       };
       subscriber.add(finish);
       const payload: Record<string, any> = { code_snippet: code, language };
+      if (source === 'GitHub URL') {
+        payload['github_url'] = code;
+      }
       if (businessDocuments && businessDocuments.length > 0) {
         payload['business_documents'] = businessDocuments;
       }
@@ -138,6 +152,7 @@ export class ReviewService {
   private fromApi(result: Record<string, any>, source: ReviewInput, name: string, code: string, language: string, businessDocuments?: BusinessDocument[]): ReviewRecord {
     const mappedComments: InlineComment[] = (result['findings'] ?? []).map((finding: ReviewFinding) => ({
       line: Number(finding.line ?? 1),
+      path: finding.path,
       severity: this.mapSeverity(String(finding.severity ?? 'low')),
       title: String(finding.message ?? 'Issue detected'),
       body: `${finding.recommendation ?? 'Review this finding.'}${finding.evidence ? ` (${finding.evidence})` : ''}`,
@@ -151,9 +166,14 @@ export class ReviewService {
     const suggestions = mappedComments.filter(comment => comment.severity === 'suggestion').length;
     const findings = mappedComments.length;
 
+    const prUrl = result['pr_url'] ?? result['github_pr_url'] ?? result['github_pr_review']?.['pr_url'];
+    const prNumber = result['pr_number'] ?? result['github_pr_review']?.['pull_number'];
+    const rawFiles = (result['files'] ?? result['github_pr_review']?.['files'] ?? []) as ReviewFile[];
+    const files = Array.isArray(rawFiles) && rawFiles.length > 0 ? rawFiles : undefined;
+
     const review: ReviewRecord = {
       id: String(result['review_id'] ?? this.createId()),
-      name: name || 'pasted-snippet.py',
+      name: String(result['name'] ?? (name || 'pasted-snippet.py')),
       source,
       language: this.displayLanguage(String(result['language'] ?? language)),
       score: Math.max(0, 100 - criticalFindings * 25 - highFindings * 15 - mediumFindings * 8 - lowFindings * 3 - suggestions * 2),
@@ -172,7 +192,10 @@ export class ReviewService {
       businessDocuments: businessDocuments,
       businessLogicFindings: (result['business_logic_findings'] ?? []) as BusinessLogicFinding[],
       recommendations: (result['recommendations'] ?? []).map(String),
-      dagEvents: (result['dag_events'] ?? []) as DagEvent[]
+      dagEvents: (result['dag_events'] ?? []) as DagEvent[],
+      prUrl: prUrl ? String(prUrl) : undefined,
+      prNumber: prNumber ? Number(prNumber) : undefined,
+      files
     };
     return review;
   }

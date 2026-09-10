@@ -1,7 +1,7 @@
 import { Component, computed, inject, signal, OnDestroy, ViewChild, ElementRef, effect } from '@angular/core';
 import { SlicePipe, DatePipe } from '@angular/common';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
-import { ReviewService, Severity } from './review.service';
+import { ReviewService, Severity, InlineComment, ReviewFile } from './review.service';
 import { Subject } from 'rxjs';
 import { takeUntil } from 'rxjs/operators';
 
@@ -31,12 +31,31 @@ interface GuidanceCard {
           <div>
             <a routerLink="/" class="back">← New review</a>
             <h1>{{ item.name }}</h1>
-            <div class="meta"><span class="python-badge">{{ item.language.slice(0, 2).toUpperCase() }}</span> {{ item.language }} <span>·</span> {{ item.source }} <span>·</span> {{ item.time }} <span>·</span> ID {{ item.id }}</div>
+            <div class="meta">
+              <span class="python-badge">{{ item.language.slice(0, 2).toUpperCase() }}</span> {{ item.language }} <span>·</span> {{ item.source }} <span>·</span> {{ item.time }} <span>·</span> ID {{ item.id }}
+              @if (item.prUrl) {
+                <span>·</span>
+                <a [href]="item.prUrl" target="_blank" rel="noopener noreferrer" class="pr-link-badge">
+                  <i class="material-symbols-outlined pr-icon" style="font-size:13px; vertical-align:middle;">open_in_new</i> View PR #{{ item.prNumber || '' }} on GitHub
+                </a>
+              }
+            </div>
           </div>
           <div class="severity-summary" aria-label="Review severity counts"><span class="severity-summary-label">FINDINGS BY SEVERITY</span><strong>{{ item.findings }} findings</strong><div class="review-counts"><b class="count-critical">{{ item.criticalFindings }} C</b><b class="count-high">{{ item.highFindings }} H</b><b class="count-medium">{{ item.mediumFindings }} M</b><b class="count-low">{{ item.lowFindings }} L</b><b class="count-suggestion">{{ item.suggestions }} S</b></div></div>
         </div>
 
         <div class="summary-banner">
+          @if (item.prUrl) {
+            <div class="pr-banner">
+              <div class="pr-banner-info">
+                <i class="material-symbols-outlined" style="font-size:18px; color:#315efb; vertical-align:middle;">call_merge</i>
+                <span><strong>Pull Request #{{ item.prNumber }}</strong> scan completed</span>
+              </div>
+              <a [href]="item.prUrl" target="_blank" rel="noopener noreferrer" class="pr-banner-btn">
+                Open PR on GitHub ↗
+              </a>
+            </div>
+          }
           <strong>Review summary</strong>
           <p>{{ item.summary ?? 'The review flagged a few high-priority issues that deserve attention before shipping.' }}</p>
           <div class="summary-tags">
@@ -65,9 +84,25 @@ interface GuidanceCard {
 
         <div class="review-grid">
           <div class="code-panel">
-            <div class="panel-top"><span>source / {{ item.name }}</span><span>{{ item.code.split('\n').length }} lines <button title="Copy code">⧉</button></span></div>
+            <div class="panel-top">
+              <span>source / {{ currentFileName() }}</span>
+              <span>{{ currentCode().split('\n').length }} lines <button title="Copy code">⧉</button></span>
+            </div>
+            @if (item.files && item.files.length > 1) {
+              <div class="file-tabs-bar">
+                @for (f of item.files; track f.path) {
+                  <button type="button" class="file-tab-btn" [class.active]="currentFilePath() === f.path" (click)="selectFile(f.path)">
+                    <i class="material-symbols-outlined" style="font-size:14px">description</i>
+                    <span class="tab-label">{{ f.path }}</span>
+                    @if (fileIssueCount(f.path); as cnt) {
+                      <b class="tab-badge">{{ cnt }}</b>
+                    }
+                  </button>
+                }
+              </div>
+            }
             <div class="code-view">
-              @for (line of item.code.split('\n'); track $index) {
+              @for (line of currentCode().split('\n'); track $index) {
                 <div class="code-line" [class.has-comment]="commentFor($index + 1)" [class.secret-line]="isSecret(commentFor($index + 1))">
                   <span class="line-no">{{ ($index + 1).toString().padStart(2, '0') }}</span>
                   @if (commentFor($index + 1); as note) {
@@ -93,11 +128,14 @@ interface GuidanceCard {
               <div><span class="panel-kicker">AI FINDINGS</span><h2>{{ item.findings }} things worth a look</h2></div>
               <button class="filter">All <span>⌄</span></button>
             </div>
-            @for (note of item.comments; track note.line) {
-              <article class="finding" [class]="note.severity" [class.selected]="selectedFinding()?.line === note.line" (click)="selectFinding(note)">
+            @for (note of item.comments; track $index) {
+              <article class="finding" [class]="note.severity" [class.selected]="selectedFinding() === note" (click)="selectFinding(note)">
                 <div class="finding-line">
                   <span class="severity-dot"></span>
                   <span class="severity-label">{{ severityLabel(note.severity) }}</span>
+                  @if (note.path) {
+                    <span class="path-badge">{{ note.path }}</span>
+                  }
                   <span class="line-label">line {{ note.line }}</span>
                 </div>
                 <h3>{{ note.title }}</h3>
@@ -109,7 +147,7 @@ interface GuidanceCard {
 
         @if (selectedFinding(); as note) {
           <section class="comparison-panel">
-            <div class="comparison-header"><div><span class="panel-kicker">SUGGESTED CHANGE</span><h2>{{ note.title }}</h2></div><span>line {{ note.line }}</span></div>
+            <div class="comparison-header"><div><span class="panel-kicker">SUGGESTED CHANGE</span><h2>{{ note.title }}</h2></div><span>{{ note.path ? note.path + ' : ' : '' }}line {{ note.line }}</span></div>
             <div class="comparison-grid">
               <div class="comparison-pane removed"><div class="comparison-label"><span>−</span> Current code</div><pre>{{ sourceLine(item.code, note.line) }}</pre></div>
               <div class="comparison-pane added"><div class="comparison-label"><span>+</span> Suggested replacement</div><pre>{{ note.replacement || 'No replacement snippet provided.' }}</pre></div>
@@ -197,9 +235,10 @@ export class ReviewComponent implements OnDestroy {
   readonly isLoading = computed(() => this.service.activeReviewId() === this.route.snapshot.paramMap.get('id'));
   readonly feedback = signal<'helpful' | 'needs_work' | ''>('');
   readonly feedbackSent = signal(false);
-  readonly selectedFinding = signal<ReturnType<typeof this.commentFor> | null>(null);
+  readonly selectedFinding = signal<InlineComment | null>(null);
   readonly selectedWorkflowNode = signal('');
   readonly workflowLogExpanded = signal(false);
+  readonly activeFilePath = signal<string>('');
   readonly workflowNodes: WorkflowNode[] = [
     { id: 'orchestrator', label: 'Orchestrator', detail: 'Pipeline control', icon: 'account_tree' },
     { id: 'deterministic_ast', label: 'Deterministic AST', detail: 'Static parsing', icon: 'code' },
@@ -220,15 +259,69 @@ export class ReviewComponent implements OnDestroy {
     // Watch for running stage changes and auto-scroll
     effect(() => {
       const item = this.review();
-      if (item && this.workflowLane) {
-        setTimeout(() => this.autoScrollToActiveStage(item), 100);
+      if (item) {
+        if (!this.activeFilePath() && item.files && item.files.length > 0) {
+          const firstWithPath = item.comments.find(c => c.path)?.path;
+          this.activeFilePath.set(firstWithPath || item.files[0].path);
+        }
+        if (this.workflowLane) {
+          setTimeout(() => this.autoScrollToActiveStage(item), 100);
+        }
       }
     });
   }
   ngOnDestroy(): void { this.destroy$.next(); this.destroy$.complete(); }
-  commentFor(line: number) { return this.review()?.comments.find(comment => comment.line === line); }
-  selectFinding(note: NonNullable<ReturnType<typeof this.commentFor>>): void { this.selectedFinding.set(note); }
-  sourceLine(code: string, line: number): string { return code.split('\n')[line - 1] || ''; }
+
+  currentFilePath(): string {
+    const item = this.review();
+    if (!item) return '';
+    return this.activeFilePath() || (item.files && item.files.length > 0 ? item.files[0].path : '');
+  }
+
+  currentFileName(): string {
+    const item = this.review();
+    if (!item) return 'pasted-snippet.py';
+    if (this.activeFilePath()) return this.activeFilePath();
+    if (item.files && item.files.length > 0) return item.files[0].path;
+    return item.name;
+  }
+
+  currentCode(): string {
+    const item = this.review();
+    if (!item) return '';
+    if (item.files && item.files.length > 0) {
+      const activePath = this.currentFilePath();
+      const file = item.files.find(f => f.path === activePath);
+      if (file) return file.code;
+    }
+    return item.code;
+  }
+
+  selectFile(path: string): void {
+    this.activeFilePath.set(path);
+  }
+
+  fileIssueCount(path: string): number {
+    return this.review()?.comments.filter(c => c.path === path).length ?? 0;
+  }
+
+  commentFor(line: number) {
+    const item = this.review();
+    if (!item) return undefined;
+    const activePath = this.currentFilePath();
+    return item.comments.find(comment => comment.line === line && (!comment.path || !activePath || comment.path === activePath));
+  }
+
+  selectFinding(note: InlineComment): void {
+    if (note.path) {
+      this.activeFilePath.set(note.path);
+    }
+    this.selectedFinding.set(note);
+  }
+
+  sourceLine(code: string, line: number): string {
+    return this.currentCode().split('\n')[line - 1] || '';
+  }
   codeParts(line: string, note: { evidence?: string }): { before: string; match: string; after: string } {
     const evidence = note.evidence;
     if (!evidence) return { before: line, match: '', after: '' };
